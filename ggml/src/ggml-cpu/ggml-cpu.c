@@ -1353,12 +1353,12 @@ void ggml_compute_forward_mul_mat(
     //   compute by src0 rows
 
     // TODO: extract to "extra_op"
+    const bool src1_cont = ggml_is_contiguous(src1);
+
 #if GGML_USE_LLAMAFILE
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
-
-    const bool src1_cont = ggml_is_contiguous(src1);
 
     if (src1_cont) {
         for (int64_t i13 = 0; i13 < ne13; i13++)

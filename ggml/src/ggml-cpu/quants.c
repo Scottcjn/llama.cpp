@@ -1388,6 +1388,10 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
 
 
 static void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
+    // i2_s interleaved kernels address full 32-byte (128-element) superblocks,
+    // but tensor storage is only n/4 bytes; a non-multiple n would read OOB.
+    // All BitNet i2_s dims are x128, so require the invariant explicitly.
+    GGML_ASSERT((n & 127) == 0 && "i2_s requires n divisible by 128");
 #if defined(__AVX2__)
     const uint8_t *    x = (uint8_t *)vx;
     const int8_t  *    y = (int8_t *)vy;
@@ -1486,20 +1490,97 @@ static void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * v
         int sumi = hsum_i32_8(accu);
         s[row] = (float)sumi;
     }
+#elif defined(__ARM_NEON)
+    // NEON kernel for the canonical INTERLEAVED i2_s layout (same layout and
+    // raw-code convention as the AVX2 kernel and the scalar fallback below:
+    // within each 32-byte chunk, byte b holds elements {b, b+32, b+64, b+96}
+    // of the 128-element superblock at bit positions 6/4/2/0; accumulate RAW
+    // codes 0/1/2 times y — callers subtract act_sums to undo the +1 offset).
+    // Handles both calling conventions:
+    //   by == 0: nrc counts WEIGHT rows; x advances by bx/4 per row, y fixed.
+    //   by != 0: nrc counts ACTIVATION columns; y advances by `by`, x fixed.
+    const uint8_t * x = (const uint8_t *)vx;
+    const int8_t  * y = (const int8_t *)vy;
+    const size_t x_stride = (by == 0) ? (bx ? bx / 4 : (size_t)n / 4) : 0;
+    const size_t y_stride = by;
+    const size_t s_stride = (bs ? bs : 1);
+    const uint8x16_t mask = vdupq_n_u8(3);
+    const int nb   = n >> 7;   // full 128-element superblocks (n % 128 == 0)
+    for (int k = 0; k < nrc; k++) {
+        const uint8_t * xr = x + (size_t)k * x_stride;
+        const int8_t  * yk = y + (size_t)k * y_stride;
+        int32x4_t acc = vdupq_n_s32(0);
+        for (int ib = 0; ib < nb; ib++) {
+            const uint8_t * px = xr + (size_t)ib * 32;
+            const int8_t  * py = yk + (size_t)ib * 128;
+            for (int h = 0; h < 2; h++) {   // two 16-byte halves of the chunk
+                const uint8x16_t p  = vld1q_u8(px + h * 16);
+                const int8x16_t w0 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(p, 6), mask));
+                const int8x16_t w1 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(p, 4), mask));
+                const int8x16_t w2 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(p, 2), mask));
+                const int8x16_t w3 = vreinterpretq_s8_u8(vandq_u8(p, mask));
+                const int8x16_t y0 = vld1q_s8(py + 0*32 + h*16);
+                const int8x16_t y1 = vld1q_s8(py + 1*32 + h*16);
+                const int8x16_t y2 = vld1q_s8(py + 2*32 + h*16);
+                const int8x16_t y3 = vld1q_s8(py + 3*32 + h*16);
+#if defined(__ARM_FEATURE_DOTPROD)
+                acc = vdotq_s32(acc, w0, y0);
+                acc = vdotq_s32(acc, w1, y1);
+                acc = vdotq_s32(acc, w2, y2);
+                acc = vdotq_s32(acc, w3, y3);
 #else
-    // Scalar fallback
+                // Widening fallback: per-lane s16 products are <= 2*127*2 = 508
+                // (two vmlal_s8 accumulations), then widened into s32 — cannot
+                // overflow int16 even for all-code-2 x all-|y|=128 inputs.
+                int16x8_t t0 = vmull_s8(vget_low_s8 (w0), vget_low_s8 (y0));
+                t0 = vmlal_s8(t0, vget_high_s8(w0), vget_high_s8(y0));
+                acc = vpadalq_s16(acc, t0);
+                int16x8_t t1 = vmull_s8(vget_low_s8 (w1), vget_low_s8 (y1));
+                t1 = vmlal_s8(t1, vget_high_s8(w1), vget_high_s8(y1));
+                acc = vpadalq_s16(acc, t1);
+                int16x8_t t2 = vmull_s8(vget_low_s8 (w2), vget_low_s8 (y2));
+                t2 = vmlal_s8(t2, vget_high_s8(w2), vget_high_s8(y2));
+                acc = vpadalq_s16(acc, t2);
+                int16x8_t t3 = vmull_s8(vget_low_s8 (w3), vget_low_s8 (y3));
+                t3 = vmlal_s8(t3, vget_high_s8(w3), vget_high_s8(y3));
+                acc = vpadalq_s16(acc, t3);
+#endif
+            }
+        }
+        int32_t sum = vaddvq_s32(acc);
+        s[(size_t)k * s_stride] = (float)sum;
+    }
+#else
+    // Scalar fallback.
+    // I2_S layout is INTERLEAVED (must match dequantize_row_i2_s and the AVX2
+    // kernel): within each 32-byte chunk, byte b holds elements
+    // {b, b+32, b+64, b+96} of the 128-element superblock at bit positions
+    // 6, 4, 2, 0 respectively.
+    // Convention: accumulate RAW 2-bit codes (0,1,2) times y, matching the
+    // AVX2 kernel; callers subtract act_sums (= sum of y) to undo the +1
+    // offset. Do NOT map to -1/0/1 here.
+    // Two calling conventions exist:
+    //   by == 0: nrc counts WEIGHT rows; x advances by bx/4 per row, y fixed.
+    //   by != 0: nrc counts ACTIVATION columns; y advances by `by`, x fixed
+    //            (ACT_PARALLEL gemm fallback, Nx1 semantics).
     const uint8_t * x = (const uint8_t *)vx;
     const int8_t * y  = (const int8_t *)vy;
-    static const int map2bit[4] = { -1, 0, 1, 0 };
-    for (int row = 0; row < nrc; row++) {
+    const size_t x_stride = (by == 0) ? (bx ? bx / 4 : (size_t)n / 4) : 0;
+    const size_t y_stride = by;
+    const size_t s_stride = (bs ? bs : 1);
+    for (int k = 0; k < nrc; k++) {
+        const uint8_t * xr = x + (size_t)k * x_stride;
+        const int8_t  * yk = y + (size_t)k * y_stride;
         int32_t sum = 0;
         for (int i = 0; i < n; i++) {
-            int byte_idx = i / 4;
-            int bit_pos = 6 - 2 * (i % 4);
-            int w = map2bit[(x[row * (n/4) + byte_idx] >> bit_pos) & 0x03];
-            sum += w * y[i];
+            const int chunk = i >> 7;          // 128-element superblock
+            const int idx   = i & 127;
+            const int gi    = idx >> 5;        // which 2-bit field (0..3)
+            const int gp    = idx & 31;        // byte within 32-byte chunk
+            const int code  = (xr[chunk * 32 + gp] >> (6 - 2 * gi)) & 0x03;
+            sum += code * yk[i];
         }
-        s[row] = (float)sum;
+        s[(size_t)k * s_stride] = (float)sum;
     }
 #endif
 }
